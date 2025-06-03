@@ -2,118 +2,132 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from io import StringIO, BytesIO
+import re
 from scipy.interpolate import interp1d
-import io
 
-st.title("Interactive Curve Modifier")
+st.title("Graph Modification with Custom Transformations")
 
-st.markdown("""
-Upload a CSV with pivot points (x,y columns).  
-Define intervals to flatten as comma-separated x_start-x_end pairs (e.g. 4-5,6-7).  
-See the plot, download modified data and plot image.
-""")
+st.sidebar.header("Input Pivot Points (format: [x,y], [x,y], ...)")
+pivot_input = st.sidebar.text_area(
+    "Enter pivot points here:",
+    value="[0, 0], [2, 3], [4, 1], [6, 4], [8, 2]"
+)
 
-# Upload pivot points CSV
-uploaded_file = st.file_uploader("Upload pivot points CSV (with columns x,y)", type=["csv"])
+# Sliders for transformation parameters
+vibration_amplitude = st.sidebar.slider("Vibration Amplitude", 0.0, 1.0, 0.2, 0.05)
+peak_height = st.sidebar.slider("Peak Height", 0.0, 2.0, 1.0, 0.1)
+flatten_level = st.sidebar.slider("Flatten Level (offset)", -1.0, 1.0, 0.0, 0.1)
 
-if uploaded_file:
-    df = pd.read_csv(uploaded_file)
-    if not {'x','y'}.issubset(df.columns):
-        st.error("CSV must contain columns: x, y")
-        st.stop()
+# Parse pivot points
+def parse_pivot_points(text):
+    pattern = r"\[\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)\s*\]"
+    points = re.findall(pattern, text)
+    return [(float(px), float(py)) for px, py in points]
 
-    x_pivot = df['x'].values
-    y_pivot = df['y'].values
+try:
+    pivot_points = parse_pivot_points(pivot_input)
+    if len(pivot_points) < 2:
+        st.sidebar.error("Please enter at least two pivot points.")
+except Exception as e:
+    st.sidebar.error(f"Error parsing pivot points: {e}")
+    pivot_points = []
 
-    # Interpolation function
-    try:
-        f = interp1d(x_pivot, y_pivot, kind='cubic', fill_value="extrapolate")
-    except Exception as e:
-        st.error(f"Error creating interpolation: {e}")
-        st.stop()
+if pivot_points and len(pivot_points) >= 2:
+    px, py = zip(*pivot_points)
+    x_dense = np.linspace(min(px), max(px), 1000)
+    f_interp = interp1d(px, py, kind='cubic')
+    y_dense = f_interp(x_dense)
 
-    # Generate dense x values
-    x = np.linspace(x_pivot.min(), x_pivot.max(), 1000)
-    y = f(x)
+    # Display original graph
+    st.subheader("Original Curve")
+    fig1, ax1 = plt.subplots()
+    ax1.plot(x_dense, y_dense, label="Original", color='blue', linewidth=2.5)
+    ax1.scatter(px, py, color='red', label="Pivot Points")
+    ax1.grid(True)
+    ax1.legend()
+    st.pyplot(fig1)
 
-    # Flatten intervals input
-    flatten_input = st.text_input(
-        "Enter flatten intervals (comma-separated, e.g. 4-5,6-7):",
-        value=""
+    # Table to define custom ranges and conditions
+    st.subheader("Define Transformations")
+    default_data = pd.DataFrame({
+        "Start X": [2.0, 5.0],
+        "End X": [4.0, 6.5],
+        "Condition": ["Flatten", "Vibration"]
+    })
+    condition_options = ["Flatten", "Vibration", "Peak", "Invariant"]
+    edited_data = st.data_editor(
+        default_data,
+        column_config={
+            "Condition": st.column_config.SelectboxColumn("Condition", options=condition_options),
+        },
+        num_rows="dynamic",
+        use_container_width=True
     )
 
-    # Process flatten intervals
-    if flatten_input.strip():
-        intervals = []
-        try:
-            parts = [s.strip() for s in flatten_input.split(",")]
-            for p in parts:
-                start, end = map(float, p.split("-"))
-                if start >= end:
-                    st.warning(f"Interval start {start} must be less than end {end}. Skipping.")
-                    continue
-                intervals.append((start, end))
-        except Exception as e:
-            st.error("Invalid flatten intervals format. Use format like: 4-5,6-7")
-            st.stop()
+    y_mod = y_dense.copy()
 
-        # Apply flattening by setting y values constant within intervals
-        for start, end in intervals:
-            mask = (x >= start) & (x <= end)
-            if np.any(mask):
-                flat_value = np.mean(y[(x >= start) & (x <= end)])
-                y[mask] = flat_value
+    # Apply transformations
+    for _, row in edited_data.iterrows():
+        x1, x2 = float(row["Start X"]), float(row["End X"])
+        condition = row["Condition"]
+        if x1 >= x2:
+            continue
 
-    # Add a demo spike (fixed between x=6 and 7)
-    spike_center = 6.5
-    spike_width = 0.05
-    spike_height = 0.5
-    spike = spike_height * np.exp(-((x - spike_center) ** 2) / (2 * spike_width ** 2))
-    spike_mask = (x >= 6) & (x <= 7)
-    y[spike_mask] += spike[spike_mask]
+        idx1 = np.searchsorted(x_dense, x1)
+        idx2 = np.searchsorted(x_dense, x2)
+        segment_x = x_dense[idx1:idx2+1]
+        segment_y = y_mod[idx1:idx2+1]
 
-    # Add demo vibration (fixed between x=7 and 8)
-    vib_mask = (x >= 7) & (x <= 8)
-    amplitude = 0.1
-    frequency = 20
-    y[vib_mask] += amplitude * np.sin(frequency * np.pi * (x[vib_mask] - 7) / (8 - 7))
+        if condition == "Flatten":
+            mean_val = np.mean(segment_y) + flatten_level
+            y_mod[idx1:idx2+1] = mean_val
+        elif condition == "Vibration":
+            vibration = vibration_amplitude * np.sin(20 * segment_x)
+            y_mod[idx1:idx2+1] = segment_y + vibration
+        elif condition == "Peak":
+            mid = (segment_x[0] + segment_x[-1]) / 2
+            sigma = (segment_x[-1] - segment_x[0]) / 6
+            gauss = np.exp(-((segment_x - mid) ** 2) / (2 * sigma ** 2))
+            y_mod[idx1:idx2+1] = segment_y + gauss * peak_height
+        # Invariant: do nothing
 
-    # Plotting
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(x, y, label="Modified curve")
-    ax.scatter(x_pivot, y_pivot, color='red', label='Pivot points')
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_title("Curve with Flattening, Spike & Vibration")
-    ax.grid(True)
-    ax.legend()
+    # Display modified curve only
+    st.subheader("Modified Curve")
+    fig2, ax2 = plt.subplots()
+    ax2.plot(x_dense, y_mod, label="Modified", color='orange', linewidth=2.5)
+    ax2.grid(True)
+    ax2.legend()
+    st.pyplot(fig2)
 
-    st.pyplot(fig)
-
-    # Prepare data for download
-    data_df = pd.DataFrame({"x": x, "y": y})
-
-    csv_buffer = io.StringIO()
-    data_df.to_csv(csv_buffer, index=False)
-    csv_data = csv_buffer.getvalue()
-
+    # Prepare PNG download
+    buf = BytesIO()
+    fig2.savefig(buf, format="png")
     st.download_button(
-        label="Download modified curve data (CSV)",
-        data=csv_data,
-        file_name="modified_curve.csv",
-        mime="text/csv"
-    )
-
-    # Save plot to buffer for image download
-    img_buffer = io.BytesIO()
-    fig.savefig(img_buffer, format="png")
-    img_buffer.seek(0)
-
-    st.download_button(
-        label="Download plot image (PNG)",
-        data=img_buffer,
-        file_name="curve_plot.png",
+        label="Download Modified Curve as PNG",
+        data=buf.getvalue(),
+        file_name="modified_curve.png",
         mime="image/png"
     )
+
+    # Modified (x, y) table
+    st.subheader("Modified (x, y) Values")
+    df_mod = pd.DataFrame({"x": x_dense, "y": y_mod})
+    st.dataframe(df_mod)
+
+    # TXT download
+    def convert_df_to_txt(df):
+        buffer = StringIO()
+        for _, row in df.iterrows():
+            buffer.write(f"{row['x']}\t{row['y']}\n")
+        return buffer.getvalue()
+
+    txt_data = convert_df_to_txt(df_mod)
+    st.download_button(
+        label="Download Modified Data as TXT",
+        data=txt_data,
+        file_name='modified_data.txt',
+        mime='text/plain'
+    )
 else:
-    st.info("Please upload a CSV file with pivot points to start.")
+    st.info("Please enter at least two valid pivot points.")
